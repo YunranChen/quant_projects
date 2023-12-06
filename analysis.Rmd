@@ -1,0 +1,636 @@
+---
+title: "data_analysis"
+output: html_document
+date: "2023-12-02"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(tidyverse)
+library(lubridate)
+library(quantmod)
+library(GGally)
+library(ggpubr)
+```
+
+Please install the package to obtain 
+
+## read data 
+
+```{r}
+datasets=map_df(1:11,function(idx){
+  res=read.csv(file = paste0("data_set_",idx,".csv"))%>%mutate(dataset=idx)
+  colnames(res)=c("date", "security_id","day","set")
+  return(res)
+})
+
+## risk factor
+rf1=read.csv("risk_factors_1.csv")
+rf2=read.csv("risk_factors_2.csv")
+rf=bind_rows(rf1,rf2)
+
+## reference
+sr1 = read.csv("security_reference_data_w_ret1d_1.csv")
+sr2 = read.csv("security_reference_data_w_ret1d_2.csv")
+sr = bind_rows(sr1,sr2)
+
+## merge data and mutate to date type
+
+srrf = merge(sr, rf, by = c("data_date", "security_id"))
+
+```
+
+## preprocessing
+
+```{r}
+srrf = srrf %>%
+  mutate(data_date=ymd(data_date)) %>%
+  mutate(l1=str_extract(group_id, "^.{2}"),
+         l2=str_extract(group_id, "^.{4}"),
+         l3=str_extract(group_id, "^.{6}"),
+         l4=str_extract(group_id, "^.{8}")) %>%
+  select(-group_id) %>%
+  arrange(security_id,data_date) %>%
+  mutate(security_id=as.factor(security_id),
+         l1=as.factor(l1),
+         l2=as.factor(l2),
+         l3=as.factor(l3),
+         l4=as.factor(l4))
+  
+srrf = srrf %>%
+  mutate(in_trading_universe=ifelse(in_trading_universe=="Y",TRUE,FALSE))
+         
+
+srrf_trade = srrf %>% 
+  arrange(security_id) %>%
+  group_by(security_id) %>%
+  summarise(prop=mean(in_trading_universe))
+
+ggplot(srrf_trade,aes(x=prop)) +
+  geom_histogram() +
+  theme_bw()
+
+### pull the id that are eligible to trade-in all the time
+
+ids = srrf_trade %>% 
+  filter(prop>0.999) %>% 
+  pull(security_id) 
+
+
+
+## only consider security that is always eligible: 1283
+
+srrf_ava = srrf %>% 
+  filter(security_id %in% ids)
+
+srrf_ava = srrf_ava %>% 
+  select(-in_trading_universe)
+
+nobs=srrf_ava %>% group_by(security_id) %>%
+  summarise(ndays = n()) 
+
+ggplot(nobs,aes(x=ndays)) +
+  geom_histogram() +
+  theme_bw()
+
+avgtbl = srrf_ava %>%
+  group_by(security_id) %>%
+  reframe(avg = sum(volume*ret1d)/sum(volume))
+
+ggplot(avgtbl,aes(x=avg)) +
+  geom_histogram() +
+  theme_bw()
+
+
+```
+
+## EDA
+
+## Feature engineering
+
+```{r}
+
+ma_cal <- function(data, window_size) {
+  data %>%
+    group_by(security_id) %>%
+    reframe(ma = rollapply(ret1d, window_size, mean, align = "right", fill = NA)) %>%
+    pull(ma)
+}
+
+
+vol_cal <- function(data, window_size) {
+  data %>%
+    group_by(security_id) %>%
+    reframe(vol = rollapply(ret1d, window_size, sd, align = "right", fill = NA)) %>%
+    pull(vol)
+}
+
+lag_cal <- function(data, lag) {
+  data %>%
+    group_by(security_id) %>%
+    reframe(lag = lag(ret1d,lag)) %>%
+    pull(lag)
+}
+
+cum_cal <- function(data) {
+  data %>%
+    group_by(security_id) %>%
+    reframe(cum = cumprod(1 + ret1d) - 1) %>%
+    pull(cum)
+}
+
+
+srrf_model_tbl = srrf_ava %>%
+  mutate(ma5 = ma_cal(srrf_ava,5),
+         ma10 = ma_cal(srrf_ava,10),
+         ma15 = ma_cal(srrf_ava,15),
+         ma20 = ma_cal(srrf_ava,20),
+         vol10 = vol_cal(srrf_ava,10),
+         vol20 = vol_cal(srrf_ava,20),
+         vol60 = vol_cal(srrf_ava,60),
+         vol120 = vol_cal(srrf_ava,120),
+         vol250 = vol_cal(srrf_ava,250),
+         lag1 = lag_cal(srrf_ava,1),
+         lag2 = lag_cal(srrf_ava,2),
+         lag3 = lag_cal(srrf_ava,3),
+         lag4 = lag_cal(srrf_ava,4),
+         lag5 = lag_cal(srrf_ava,5),
+         dayofweek = weekdays(data_date) %>% factor(.,levels = c("Monday", "Tuesday", "Wednesday", "Thursday", "Friday")),
+         historial_return = cum_cal(srrf_ava)
+         )
+
+srrf_model_tbl %>% pull(l1) %>% unique() %>% length()
+srrf_model_tbl %>% pull(l2) %>% unique() %>% length()
+srrf_model_tbl %>% pull(l3) %>% unique() %>% length()
+srrf_model_tbl %>% pull(l4) %>% unique() %>% length()
+
+```
+
+## merge data from ouside source: 1 month daily treasury rate
+
+```{r}
+idx_year = seq(2010,2017)
+
+rfr_tbl = map_df(idx_year,function(x){
+  tbl = read.csv(paste0("./daily-treasury-rates/daily-treasury-rates",x,".csv"))[,c(1,3)]
+  colnames(tbl) = c("data_date","rfr")
+  tbl = tbl %>% 
+    mutate(data_date = mdy(data_date),
+           rfr = rfr/250)
+})
+
+srrf_model_tbl = srrf_model_tbl %>%
+  left_join(rfr_tbl,by = "data_date")
+
+```
+
+```{r}
+id8yr = nobs %>% 
+  filter(ndays>=2000) %>%
+  pull(security_id)
+
+srrf_model_tbl = srrf_model_tbl %>%
+  filter(security_id %in% id8yr)
+```
+
+## Feature Selection
+
+```{r}
+library("xgboost")
+```
+
+### split data to training, validation, testing
+
+
+```{r}
+min(srrf_model_tbl$data_date)
+# Split the data into training, validation, and test sets
+
+train_end_date <- ymd("2009-12-31") + years(5)  # Adjust based on your dataset
+val_start_date <- train_end_date + 1
+val_end_date <- train_end_date + years(1)  # Adjust based on your dataset
+test_start_date <- val_end_date + 1
+
+train_data <- srrf_model_tbl %>%
+  filter(data_date <= train_end_date) %>%
+  na.omit()
+val_data <- srrf_model_tbl %>%
+  filter(srrf_model_tbl$data_date >= val_start_date & srrf_model_tbl$data_date <= val_end_date) %>%
+  na.omit()
+test_data <- srrf_model_tbl %>% filter(srrf_model_tbl$data_date >= test_start_date)%>%
+  na.omit()
+
+# Convert data to DMatrix
+dtrain <- xgb.DMatrix(data = model.matrix(~.-1,data = train_data%>%select(-c("data_date", "security_id", "ret1d"))), label = train_data$ret1d)
+
+dval <- xgb.DMatrix(data = model.matrix(~.-1,data = val_data %>%
+                                          select(-c("data_date", "security_id", "ret1d"))), label = val_data$ret1d)
+
+dtest <- xgb.DMatrix(data = model.matrix(~.-1,data = test_data%>%select(-c("data_date", "security_id", "ret1d"))), label = test_data$ret1d)
+
+# Define parameters
+params <- list(
+  objective = "reg:squarederror",  # for regression tasks
+  eval_metric = "rmse",             # evaluation metric
+  max_depth = 6
+)
+
+# Train the model
+xgb_model <- xgboost(params = params, data = dtrain, nrounds = 100, evals = list(val = dval), early_stopping_rounds = 10)
+#xgb_model = xgb_model_t6
+#xgb_model_t6 = xgb_model
+#xgb_model_t4 = xgb_model
+#xgb_model_t8 = xgb_model
+# Make predictions on the test set
+#predictions4 <- predict(xgb_model_t4, dval)
+#pred_rmse4 = sqrt(mean((predictions4-val_data$ret1d)^2))
+#pred_rmse4
+#predictions6 <- predict(xgb_model_t6, dval)
+#pred_rmse6 = sqrt(mean((predictions6-val_data$ret1d)^2))
+#pred_rmse6
+#predictions8 <- predict(xgb_model_t8, dval)
+#pred_rmse8 = sqrt(mean((predictions8-val_data$ret1d)^2))
+#pred_rmse8
+predictions <- predict(xgb_model, dtest)
+pred_rmse = sqrt(mean((predictions-val_data$ret1d)^2))
+pred_rmse
+
+importance_matrix <- xgb.importance(model = xgb_model)
+print(importance_matrix)
+
+## important feature
+importance_matrix = xgb.importance(colnames(dtrain), model = xgb_model)
+xgb.plot.importance(importance_matrix = importance_matrix,top_n = 15)
+
+## rmse 
+
+pred_r = predictions-test_data$ret1d
+#pred_r
+
+## residual plot
+
+p_norm = ggplot(tibble(resid=pred_r), aes(sample = resid)) + 
+  stat_qq() + 
+  stat_qq_line() + 
+  theme_bw() +
+  ggtitle("(b) Normal QQ plot")
+
+params <- as.list(MASS::fitdistr(pred_r, "t")$estimate)
+p_tdist = ggplot(tibble(resid=pred_r), aes(sample = resid)) + 
+  stat_qq(distribution = qt, dparams = params["df"]) + 
+  stat_qq_line(distribution = qt, dparams = params["df"]) + 
+  theme_bw() +
+  ggtitle("(c) T-dist QQ plot")
+
+# proportion within 3 sd
+
+mean(abs(scale(pred_r))<3)
+
+# residual plot in original scale 
+
+p_resid = ggplot(tibble(ind=1:length(pred_r),resid=pred_r),aes(x=ind,y=resid)) +
+  geom_point() +
+  geom_hline(yintercept = 0) +
+  theme_bw() +
+  ggtitle("(c) Residual QQ plot")
+
+p_residall = ggarrange(plotlist = list(p_resid,p_norm,p_tdist),ncol = 3)
+
+ggsave(filename = "residual_summary.jpeg",plot = p_residall,width = 9,height = 3)
+```
+
+## Portfolio construction
+
+prepare data to fit in the optimization function
+
+```{r}
+library("CVXR")
+```
+
+
+```{r}
+pred_tbl = tibble(return=predictions,
+                  date=val_data$data_date,
+                  security_id=val_data$security_id,
+                  weekday=val_data$dayofweek) %>%
+  arrange(security_id,date) %>%
+  filter(weekday == "Monday") %>%
+  select(-weekday)
+#pred_tbl%>%pull(date)%>%.[1:45]
+# from long to wide
+port_tbl = pred_tbl %>% pivot_wider(names_from = security_id, 
+                          values_from = return)
+port_tbl = port_tbl %>% arrange(date)
+
+return_mat = as.matrix(port_tbl[,-1])
+
+sum(is.na(return_mat))
+idx_na=which(is.na(return_mat),arr.ind=TRUE)
+for (i in 1:nrow(idx_na)){
+  if (idx_na[i,1]==1){
+    return_mat[idx_na[i,1],idx_na[i,2]] = return_mat[idx_na[i,1]+1,idx_na[i,2]]}
+  else{
+      return_mat[idx_na[i,1],idx_na[i,2]] = return_mat[idx_na[i,1]-1,idx_na[i,2]]
+    }
+}
+
+# dealing with NA
+
+Sigma = train_data %>%
+  select(data_date,security_id,ret1d) %>%
+  pivot_wider(names_from = security_id, 
+                          values_from = ret1d) %>%
+  .[,-1]%>%
+  as.matrix()%>%
+  cov(.,use = "pairwise.complete.obs" )
+
+library("matrixcalc")
+is.positive.definite(Sigma)
+```
+
+hyperparameter tuning
+
+```{r}
+## you can skip this tunning part which is quite time consuming
+
+lams = c(1,5,10,50)
+RESULT = vector(mode = "list",length = length(lams))
+for (j in 1:length(lams)){
+  lam = lams[j]
+  Weights = matrix(0,nrow=nrow(Sigma_history),ncol = nrow(return_mat))
+res = matrix(0,nrow = nrow(return_mat),ncol = 3)
+d = 1
+  mu = return_mat[d,]%>%as.matrix(ncol=1)
+  n = length(mu)
+  # form problem
+  weights = Variable(n)
+  w_plus <- Variable(n)
+  w_minus <- Variable(n)
+  constraints <- list(weights == w_plus + w_minus,
+                      w_plus >= 0,
+                      w_minus <= 0,
+                      sum(w_plus) == 1,
+                      sum(w_minus) == -1)
+  
+  ret = t(weights) %*% mu
+  #trans = 0.0001 * sum(abs(weights - Weights[, d]*(1+return_mat[d,])))
+  risk = quad_form(weights, Sigma)
+  objective = Maximize(ret - lam * risk)
+  
+  problem = Problem(objective, constraints)
+  result = solve(problem)
+  Weights[,1] = result$getValue(weights)
+  res[1,]=c(result$getValue(ret),result$getValue(risk),0)
+  
+pb <- txtProgressBar(min = 2, max = nrow(return_mat), style = 3)
+
+for (d in 2:nrow(return_mat)){
+  mu = return_mat[d,]%>%as.matrix(ncol=1)
+  n = length(mu)
+  # form problem
+  weights = Variable(n)
+  w_plus <- Variable(n)
+  w_minus <- Variable(n)
+  constraints <- list(weights == w_plus + w_minus,
+                      w_plus >= 0,
+                      w_minus <= 0,
+                      sum(w_plus) == 1,
+                      sum(w_minus) == -1)
+  
+  ret = t(weights) %*% mu
+  trans = 0.0001 * sum(abs(weights - Weights[, d-1]*(1+return_mat[d-1,])))
+  risk = quad_form(weights, Sigma)
+  objective = Maximize(ret - trans - lam * risk)
+  # solve
+  problem = Problem(objective, constraints)
+  result = solve(problem)
+  Weights[, d] <- result$getValue(weights)
+  res[d,]=c(result$getValue(ret),result$getValue(risk),result$getValue(trans))
+  setTxtProgressBar(pb, d)
+}
+close(pb)
+RESULT[[j]] = list(Weights,res)
+}
+```
+
+trade-off curve to pick lambda
+
+```{r}
+# can skip this part too
+mvar=sapply(1:length(lams),function(x){
+  RESULT[[x]][[2]][1:nrow(return_mat),]%>%
+    apply(.,2,mean)%>%
+    .[-3]
+},simplify = T)%>%t()
+
+colnames(mvar)=c("return","risk")
+
+mvar_tbl = as_tibble(mvar)%>%
+  mutate(lam = lams, 
+         risk = sqrt(risk))
+
+ggplot(mvar_tbl,aes(x=risk,y=return)) +
+  geom_point() +
+  geom_line() +
+  geom_text(aes(label=lam),nudge_y = 0.0003) +
+  theme_bw() +
+  xlab("risk(standard deviation)")
+```
+
+choose lam = 10 
+
+## prediction on test dataset 
+
+```{r}
+predictions_test <- predict(xgb_model, dtest)
+
+pred_tbl_test = tibble(return=predictions_test,
+                  date=test_data$data_date,
+                  security_id=test_data$security_id,
+                  weekday=test_data$dayofweek) %>%
+  arrange(security_id,date) %>%
+  filter(weekday == "Monday") %>%
+  select(-weekday)
+#pred_tbl%>%pull(date)%>%.[1:45]
+# from long to wide
+port_tbl_test = pred_tbl_test %>% pivot_wider(names_from = security_id, 
+                          values_from = return)
+port_tbl_test = port_tbl_test %>% arrange(date)
+
+return_mat_test = as.matrix(port_tbl_test[,-1])
+
+sum(is.na(return_mat_test))
+idx_na=which(is.na(return_mat_test),arr.ind=TRUE)
+for (i in 1:nrow(idx_na)){
+  if (idx_na[i,1]==1){
+    return_mat_test[idx_na[i,1],idx_na[i,2]] = return_mat_test[idx_na[i,1]+1,idx_na[i,2]]}
+  else{
+      return_mat_test[idx_na[i,1],idx_na[i,2]] = return_mat_test[idx_na[i,1]-1,idx_na[i,2]]
+    }
+}
+
+  lam = 10
+  Weights = matrix(0,nrow=nrow(Sigma),ncol = nrow(return_mat_test))
+res = matrix(0,nrow = nrow(return_mat_test),ncol = 3)
+
+d = 1
+  mu = return_mat_test[d,]%>%as.matrix(ncol=1)
+  n = length(mu)
+  # form problem
+  weights = Variable(n)
+  w_plus <- Variable(n)
+  w_minus <- Variable(n)
+  constraints <- list(weights == w_plus + w_minus,
+                      w_plus >= 0,
+                      w_minus <= 0,
+                      sum(w_plus) == 1,
+                      sum(w_minus) == -1)
+  
+  ret = t(weights) %*% mu
+  #trans = 0.0001 * sum(abs(weights - Weights[, d]*(1+return_mat[d,])))
+  risk = quad_form(weights, Sigma)
+  objective = Maximize(ret - lam * risk)
+  
+  problem = Problem(objective, constraints)
+  result = solve(problem)
+  Weights[,1] = result$getValue(weights)
+  res[1,]=c(result$getValue(ret),result$getValue(risk),0)
+  
+pb <- txtProgressBar(min = 2, max = nrow(return_mat_test), style = 3)
+
+for (d in 2:nrow(return_mat_test)){
+  mu = return_mat_test[d,]%>%as.matrix(ncol=1)
+  n = length(mu)
+  # form problem
+  weights = Variable(n)
+  w_plus <- Variable(n)
+  w_minus <- Variable(n)
+  constraints <- list(weights == w_plus + w_minus,
+                      w_plus >= 0,
+                      w_minus <= 0,
+                      sum(w_plus) == 1,
+                      sum(w_minus) == -1)
+  
+  ret = t(weights) %*% mu
+  trans = 0.0001 * sum(abs(weights - Weights[, d-1]*(1+return_mat_test[d-1,])))
+  risk = quad_form(weights, Sigma)
+  objective = Maximize(ret - trans - lam * risk)
+  # solve
+  problem = Problem(objective, constraints)
+  result = solve(problem)
+  Weights[, d] <- result$getValue(weights)
+  res[d,]=c(result$getValue(ret),result$getValue(risk),result$getValue(trans))
+  setTxtProgressBar(pb, d)
+}
+close(pb)
+
+```
+
+## Portfolio performance
+
+```{r}
+
+## obtain the true return matrix
+pred_tbl_true = test_data %>%
+  select(ret1d,data_date,security_id,dayofweek) %>%
+  arrange(security_id, data_date) %>%
+  filter(dayofweek == "Monday") %>%
+  select(-dayofweek)
+#pred_tbl%>%pull(date)%>%.[1:45]
+# from long to wide
+port_tbl_true = pred_tbl_true%>% pivot_wider(names_from = security_id, 
+                          values_from = ret1d)
+port_tbl_true = port_tbl_true %>% arrange(data_date)
+
+return_mat_true = as.matrix(port_tbl_true[,-1])
+
+# impute test data:maybe not. use na.rm
+
+#idx_na=which(is.na(return_mat_true),arr.ind=TRUE)
+#for (i in 1:nrow(idx_na)){
+#  if (idx_na[i,1]==1){
+#    return_mat_true[idx_na[i,1],idx_na[i,2]] = #return_mat_true[idx_na[i,1]+1,idx_na[i,2]]}
+#  else{
+#      return_mat_true[idx_na[i,1],idx_na[i,2]] = #return_mat_true[idx_na[i,1]-1,idx_na[i,2]]
+#    }
+#}
+
+
+dim(return_mat_true) # t * p
+Weights%>%dim() # p * t
+# t * p 
+return_true=apply(t(Weights)*return_mat_true,1,sum,na.rm=TRUE)
+
+res_tbl = as_tibble(res)
+# volatility 
+mean(return_true)
+vol = sd(return_true) 
+vol
+# % of pos 
+mean(return_true>0)
+
+
+rfr90 = test_data %>%
+  filter(dayofweek=="Monday")%>%
+  select(data_date,rfr)%>%
+  distinct()%>%
+  pull(rfr)
+
+library("matrixStats")
+# turnover
+turnover = rowDiffs(Weights)%>%
+  abs()%>%
+  apply(.,2,sum)/4*100
+
+turnover= c(0,turnover)
+mean(turnover)
+res_stats=tibble(
+  return = return_true,
+  turnover = turnover,
+         date = port_tbl_test$date,
+         sharpe = (return - rfr90)/vol,
+         cum_return = cumsum(return))%>%
+  mutate(drawdown = cummax(cum_return) - cum_return)
+
+mean(res_stats$sharpe>3)
+
+# drawdown: larger the better, 
+res_stats_long = res_stats %>%
+  pivot_longer(!date, names_to = "statistics", values_to = "value")
+
+summary(res_stats[,-3])
+
+# mean return, mean risk_sd (volatility)
+apply(as.matrix(res_tbl[,-"date"]),2,mean)
+
+
+
+Weights
+
+# visualization 
+p_summary_res = ggplot(res_stats_long %>%
+         filter(statistics!="drawdown"),
+       aes(x=date,y=value)) +
+  geom_point() +
+  geom_line() +
+  theme_bw() +
+  facet_wrap(~statistics, scales = "free")
+
+p_hist_res = ggplot(res_stats_long %>%
+         filter(!statistics%in%c("drawdown","cum_return")),
+       aes(x=value)) +
+  geom_histogram() +
+  theme_bw() +
+  facet_wrap(~statistics, scales = "free") +
+  geom_vline(data = res_stats_long %>%
+               filter(!statistics%in%c("drawdown","cum_return")) %>%
+               group_by(statistics) %>%
+               summarise(mean = mean(value)),
+             aes(xintercept = mean))
+
+ggsave(filename = "return_summary.jpeg",plot = p_summary_res,width = 8,height = 5)
+ggsave(filename = "return_hist.jpeg",plot = p_hist_res,width = 8,height = 4)
+
+```
+
+
